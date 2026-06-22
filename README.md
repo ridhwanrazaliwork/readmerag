@@ -1,4 +1,4 @@
-# ReadmeRiddle
+# ReadmeRag
 
 A lightweight, zero-cost RAG (Retrieval-Augmented Generation) chatbot that answers questions about a developer's GitHub projects. It fetches README files from a GitHub profile, indexes them in a local vector database, and uses a free-tier LLM to answer questions.
 
