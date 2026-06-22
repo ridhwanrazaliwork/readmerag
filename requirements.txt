@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+httpx
+chromadb
+litellm
+slowapi
+python-dotenv
+
+# optional, for testing
+jupyter
