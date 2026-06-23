@@ -1,0 +1,20 @@
+[project]
+name = "readmeriddle"
+version = "1.0.0"
+description = "RAG chatbot that answers questions about GitHub projects"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "httpx",
+    "chromadb",
+    "litellm",
+    "slowapi",
+    "python-dotenv",
+]
+
+[project.optional-dependencies]
+dev = ["jupyter"]
+
+[tool.uv]
+dev-dependencies = ["jupyter"]

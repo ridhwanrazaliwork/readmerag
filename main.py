@@ -1,11 +1,11 @@
+import json as _json
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-
 from pathlib import Path
 
 from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -34,6 +34,30 @@ def _is_recent(updated_at: str) -> bool:
         return True
 
 
+PERSONAL_KEYWORDS = [
+    "experience", "work", "resume", "job", "education",
+    "school", "cv", "hire", "background", "bachelor",
+    "master", "degree", "career", "skill", "skills",
+    "contact", "email",
+]
+
+GLOBAL_LIST_KEYWORDS = [
+    "list all", "all my repo", "what repositories",
+    "show all projects", "list of all", "what apps",
+    "every repo", "all projects", "all your repos",
+]
+
+
+def is_personal_query(query: str) -> bool:
+    q = query.lower()
+    return any(kw in q for kw in PERSONAL_KEYWORDS)
+
+
+def is_global_list_query(query: str) -> bool:
+    q = query.lower()
+    return any(kw in q for kw in GLOBAL_LIST_KEYWORDS)
+
+
 def ingest_all_readmes():
     username = config.GITHUB_USERNAME
     logger.info("Starting ingestion for user '%s'", username)
@@ -41,10 +65,10 @@ def ingest_all_readmes():
     if not all_repos:
         logger.warning("No repos found for '%s'", username)
         return
-    recent = [(name, date) for name, date in all_repos if _is_recent(date)]
+    recent = [(name, date, desc, topics) for name, date, desc, topics in all_repos if _is_recent(date)]
     logger.info("Found %d repos updated in last 2 years (out of %d total)", len(recent), len(all_repos))
 
-    active = {name for name, _ in recent}
+    active = {name for name, _, _, _ in recent}
     stored = db.get_all_repo_names()
     orphans = stored - active
     for name in orphans:
@@ -52,16 +76,21 @@ def ingest_all_readmes():
     if orphans:
         logger.info("Cleaned %d orphaned repos from ChromaDB", len(orphans))
 
-    for repo_name, updated_at in recent:
+    for repo_name, updated_at, description, topics in recent:
         readme = github_client.fetch_readme(username, repo_name)
         if readme is None:
             continue
         cleaned = markdown_cleaner.clean_markdown_for_rag(readme)
         chunks = vector_engine.chunk_text(cleaned, repo_name, updated_at=updated_at)
+        if repo_name == username:
+            for _, _, meta in chunks:
+                meta["is_bio"] = True
         db.upsert_documents(
             chunks,
             repo_name=repo_name,
             updated_at=updated_at,
+            repo_description=description,
+            repo_tags=topics,
         )
     logger.info("Ingestion complete. Total chunks: %d", db.count)
 
@@ -77,7 +106,7 @@ async def lifespan(app: FastAPI):
     logger.info("Shutting down...")
 
 
-app = FastAPI(title="ReadmeRiddle", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="ReadmeRag", version="1.0.0", lifespan=lifespan)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -88,7 +117,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=config.CORS_ORIGINS.split(",") if config.CORS_ORIGINS != "*" else ["*"],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -102,23 +131,45 @@ async def serve_frontend():
     return FileResponse(STATIC_DIR / "index.html")
 
 
+def _route_query(query: str):
+    if is_global_list_query(query):
+        catalog = db.get_catalog()
+        if not catalog:
+            return None, None, []
+        lines = [
+            f"- **{r['repo_name']}** (updated {r['updated_at'][:10]}): {r['description']} [Tags: {r['tags']}]"
+            for r in catalog
+        ]
+        context = "\n".join(lines)
+        sources = [{"repo": r["repo_name"], "content_preview": r["description"][:200]} for r in catalog[:10]]
+        return context, "catalog", sources
+    elif is_personal_query(query):
+        results = db.search(query, n_results=3, where={"is_bio": True})
+    else:
+        results = db.search(query, n_results=3)
+    if not results:
+        return None, None, []
+    context = "\n\n---\n\n".join(r["content"] for r in results)
+    sources = [
+        {"repo": r["metadata"]["repo_name"], "content_preview": r["content"][:200]}
+        for r in results
+    ]
+    return context, "readme", sources
+
+
 @app.post("/api/chat")
 @limiter.limit("5/minute")
 async def chat_endpoint(request: Request):
     body = await request.json()
     query = body.get("query", "").strip()
+    history = body.get("history")
     if not query:
         return JSONResponse({"response": "Please provide a query."}, status_code=400)
     try:
-        results = db.search(query, n_results=3)
-        if not results:
+        context, context_type, sources = _route_query(query)
+        if context is None:
             return {"response": "I couldn't find any relevant information to answer that.", "sources": []}
-        context = "\n\n---\n\n".join(r["content"] for r in results)
-        answer = llm_client.chat(query, context)
-        sources = [
-            {"repo": r["metadata"]["repo_name"], "content_preview": r["content"][:200]}
-            for r in results
-        ]
+        answer = llm_client.chat(query, context, history=history, context_type=context_type or "readme")
         return {"response": answer, "sources": sources}
     except Exception as e:
         logger.error("Chat endpoint error: %s", e)
@@ -126,6 +177,35 @@ async def chat_endpoint(request: Request):
             {"response": "Sorry, an internal error occurred.", "sources": []},
             status_code=500,
         )
+
+
+@app.post("/api/chat/stream")
+@limiter.limit("5/minute")
+async def chat_stream_endpoint(request: Request):
+    body = await request.json()
+    query = body.get("query", "").strip()
+    history = body.get("history")
+    if not query:
+        return JSONResponse({"response": "Please provide a query."}, status_code=400)
+
+    context, context_type, _ = _route_query(query)
+
+    async def generate():
+        if context is None:
+            yield f"data: {_json.dumps({'token': 'I could not find any relevant information.'})}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+        try:
+            for token in llm_client.chat_stream(query, context, history=history,
+                                                  context_type=context_type or "readme"):
+                yield f"data: {_json.dumps({'token': token})}\n\n"
+            yield "data: [DONE]\n\n"
+        except Exception as e:
+            logger.error("Stream error: %s", e)
+            yield f"data: {_json.dumps({'token': 'An error occurred while generating the response.'})}\n\n"
+            yield "data: [DONE]\n\n"
+
+    return StreamingResponse(generate(), media_type="text/event-stream")
 
 
 @app.post("/api/ingest")

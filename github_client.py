@@ -13,7 +13,7 @@ def _headers():
     return headers
 
 
-def get_repos(username: str) -> list[tuple[str, str]]:
+def get_repos(username: str) -> list[tuple[str, str, str, list[str]]]:
     repos = []
     page = 1
     client = httpx.Client()
@@ -30,7 +30,12 @@ def get_repos(username: str) -> list[tuple[str, str]]:
             if not page_data:
                 break
             for r in page_data:
-                repos.append((r["name"], r.get("updated_at", "")))
+                repos.append((
+                    r["name"],
+                    r.get("updated_at", ""),
+                    r.get("description") or "",
+                    r.get("topics", []),
+                ))
             page += 1
     except httpx.HTTPError as e:
         logger.error("Failed to fetch repos: %s", e)

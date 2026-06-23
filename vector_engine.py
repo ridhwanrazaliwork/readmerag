@@ -58,6 +58,14 @@ def _make_chunk_id(repo_name: str, text: str, index: int) -> str:
 
 
 class VectorDB:
+    TIME_KEYWORDS = [
+        "latest", "newest", "most recent", "recently",
+        "last updated", "new project", "recent project",
+        "new repo", "newest repo", "latest repo", 
+        "last month", "current", "past 6 months", "past 3 months",
+        "past year",
+    ]
+
     def __init__(self):
         self.client = chromadb.PersistentClient(path=config.CHROMA_DB_PATH)
         try:
@@ -82,6 +90,22 @@ class VectorDB:
         metas = self.collection.get(include=["metadatas"])["metadatas"]
         return {m["repo_name"] for m in metas if "repo_name" in m}
 
+    def get_catalog(self) -> list[dict]:
+        if self.count == 0:
+            return []
+        metas = self.collection.get(include=["metadatas"])["metadatas"]
+        unique: dict[str, dict] = {}
+        for m in metas:
+            name = m.get("repo_name", "")
+            if name and name not in unique:
+                unique[name] = {
+                    "repo_name": name,
+                    "description": m.get("repo_description", ""),
+                    "tags": m.get("repo_tags", ""),
+                    "updated_at": m.get("updated_at", ""),
+                }
+        return list(unique.values())
+
     def delete_repo_chunks(self, repo_name: str):
         ids = self.collection.get(where={"repo_name": repo_name})["ids"]
         if not ids:
@@ -94,6 +118,8 @@ class VectorDB:
         chunks: list[tuple[str, str, dict]],
         repo_name: str,
         updated_at: str | None = None,
+        repo_description: str | None = None,
+        repo_tags: list[str] | None = None,
     ):
         if not chunks:
             return
@@ -102,12 +128,17 @@ class VectorDB:
         metadatas = []
         if updated_at is None:
             updated_at = datetime.now(timezone.utc).isoformat()
+        updated_at_ts = int(updated_at[:10].replace("-", ""))
+        tags_str = ", ".join(repo_tags) if repo_tags else ""
         for chunk_id, text, extra_meta in chunks:
             ids.append(chunk_id)
             documents.append(text)
             metadatas.append({
                 "repo_name": repo_name,
                 "updated_at": updated_at,
+                "updated_at_ts": updated_at_ts,
+                "repo_description": repo_description or "",
+                "repo_tags": tags_str,
                 **extra_meta,
             })
         embeddings = llm_client.get_embeddings(documents)
@@ -122,12 +153,23 @@ class VectorDB:
         else:
             logger.warning("Embedding failed for repo '%s', skipping upsert", repo_name)
 
-    def _dense_search(self, query_embedding: list[float], limit: int = 18) -> list[dict]:
-        results = self.collection.query(
-            query_embeddings=[query_embedding],
-            n_results=limit,
-            include=["documents", "metadatas", "distances", "embeddings"],
-        )
+    def _get_time_filter(self, query: str) -> dict | None:
+        query_lower = query.lower()
+        if any(kw in query_lower for kw in self.TIME_KEYWORDS):
+            from datetime import datetime, timedelta
+            cutoff = (datetime.utcnow() - timedelta(days=180)).strftime("%Y%m%d")
+            return {"updated_at_ts": {"$gte": int(cutoff)}}
+        return None
+
+    def _dense_search(self, query_embedding: list[float], limit: int = 18, where: dict | None = None) -> list[dict]:
+        kwargs = {
+            "query_embeddings": [query_embedding],
+            "n_results": limit,
+            "include": ["documents", "metadatas", "distances", "embeddings"],
+        }
+        if where:
+            kwargs["where"] = where
+        results = self.collection.query(**kwargs)
         if not results["ids"][0]:
             return []
         candidates = []
@@ -221,14 +263,22 @@ class VectorDB:
         sorted_ids = sorted(scores, key=scores.__getitem__, reverse=True)
         return sorted_ids[:k]
 
-    def search(self, query: str, n_results: int = 3) -> list[dict]:
+    def search(self, query: str, n_results: int = 3, where: dict | None = None) -> list[dict]:
         query_embedding = llm_client.get_embeddings([query])
         if not query_embedding:
             return []
 
         query_vec = query_embedding[0]
 
-        dense_pool = self._dense_search(query_vec, limit=n_results * 6)
+        if where is not None:
+            dense_pool = self._dense_search(query_vec, limit=n_results * 6, where=where)
+        else:
+            time_filter = self._get_time_filter(query)
+            dense_pool = self._dense_search(query_vec, limit=n_results * 6, where=time_filter)
+            if time_filter and len(dense_pool) < n_results * 2:
+                logger.info("Time filter limited candidates (%d); falling back to unfiltered", len(dense_pool))
+                dense_pool = self._dense_search(query_vec, limit=n_results * 6)
+
         if not dense_pool:
             return []
 
@@ -265,13 +315,12 @@ class VectorDB:
         selected_indices: list[int] = []
         remaining = list(range(len(candidates)))
 
-        # Cosine distance → similarity
         query_sims = [1.0 - c["distance"] for c in candidates]
 
         while len(selected_indices) < min(n_results, len(candidates)):
             best_score = -float("inf")
-            best_idx = -1
-            for i in remaining:
+            best_pos = -1
+            for pos, i in enumerate(remaining):
                 sim_to_query = query_sims[i]
                 if selected_indices:
                     max_sim_to_sel = max(
@@ -283,7 +332,7 @@ class VectorDB:
                 mmr_score = lambda_mult * sim_to_query - (1.0 - lambda_mult) * max_sim_to_sel
                 if mmr_score > best_score:
                     best_score = mmr_score
-                    best_idx = i
-            selected_indices.append(remaining.pop(best_idx))
+                    best_pos = pos
+            selected_indices.append(remaining.pop(best_pos))
 
         return [candidates[i] for i in selected_indices]
