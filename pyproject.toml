@@ -17,4 +17,4 @@ dependencies = [
 dev = ["jupyter"]
 
 [tool.uv]
-dev-dependencies = ["jupyter"]
+dev-dependencies = ["jupyter", "pytest"]

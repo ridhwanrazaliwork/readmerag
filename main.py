@@ -15,6 +15,7 @@ import config
 import github_client
 import markdown_cleaner
 import vector_engine
+from vector_engine import TIME_KEYWORDS
 import llm_client
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -58,6 +59,10 @@ def is_global_list_query(query: str) -> bool:
     return any(kw in q for kw in GLOBAL_LIST_KEYWORDS)
 
 
+def is_time_query(query: str) -> bool:
+    return any(kw in query.lower() for kw in TIME_KEYWORDS)
+
+
 def ingest_all_readmes():
     username = config.GITHUB_USERNAME
     logger.info("Starting ingestion for user '%s'", username)
@@ -81,10 +86,21 @@ def ingest_all_readmes():
         if readme is None:
             continue
         cleaned = markdown_cleaner.clean_markdown_for_rag(readme)
-        chunks = vector_engine.chunk_text(cleaned, repo_name, updated_at=updated_at)
-        if repo_name == username:
-            for _, _, meta in chunks:
-                meta["is_bio"] = True
+        if len(cleaned.strip()) < 30:
+            placeholder_id = f"{repo_name}_empty_placeholder"
+            placeholder_text = (
+                f"This repository '{repo_name}' does not have a detailed README. "
+                f"Description: {description or 'No description provided.'}"
+            )
+            extra = {"is_empty_placeholder": True}
+            if repo_name == username:
+                extra["is_bio"] = True
+            chunks = [(placeholder_id, placeholder_text, extra)]
+        else:
+            chunks = vector_engine.chunk_text(cleaned, repo_name, updated_at=updated_at)
+            if repo_name == username:
+                for _, _, meta in chunks:
+                    meta["is_bio"] = True
         db.upsert_documents(
             chunks,
             repo_name=repo_name,
@@ -145,10 +161,25 @@ def _route_query(query: str):
         return context, "catalog", sources
     elif is_personal_query(query):
         results = db.search(query, n_results=3, where={"is_bio": True})
+        if not results:
+            return None, None, []
+        if results[0]["metadata"].get("is_empty_placeholder"):
+            return (
+                "I haven't added detailed experience/skill documentation yet. Stay tuned!",
+                "guardrail",
+                [],
+            )
     else:
         results = db.search(query, n_results=3)
-    if not results:
-        return None, None, []
+        if not results:
+            return None, None, []
+        if results[0]["metadata"].get("is_empty_placeholder"):
+            repo = results[0]["metadata"]["repo_name"]
+            return (
+                f"I found the repository '{repo}', but the developer hasn't added a detailed README file for it yet.",
+                "guardrail",
+                [],
+            )
     context = "\n\n---\n\n".join(r["content"] for r in results)
     sources = [
         {"repo": r["metadata"]["repo_name"], "content_preview": r["content"][:200]}
@@ -167,6 +198,8 @@ async def chat_endpoint(request: Request):
         return JSONResponse({"response": "Please provide a query."}, status_code=400)
     try:
         context, context_type, sources = _route_query(query)
+        if context_type == "guardrail":
+            return {"response": context, "sources": sources}
         if context is None:
             return {"response": "I couldn't find any relevant information to answer that.", "sources": []}
         answer = llm_client.chat(query, context, history=history, context_type=context_type or "readme")
@@ -188,21 +221,27 @@ async def chat_stream_endpoint(request: Request):
     if not query:
         return JSONResponse({"response": "Please provide a query."}, status_code=400)
 
-    context, context_type, _ = _route_query(query)
+    context, context_type, sources = _route_query(query)
 
     async def generate():
-        if context is None:
-            yield f"data: {_json.dumps({'token': 'I could not find any relevant information.'})}\n\n"
+        if context_type == "guardrail":
+            yield f"data: {_json.dumps({'type': 'token', 'token': context})}\n\n"
             yield "data: [DONE]\n\n"
             return
+        if context is None:
+            yield f"data: {_json.dumps({'type': 'token', 'token': 'I could not find any relevant information.'})}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+        if sources:
+            yield f"data: {_json.dumps({'type': 'sources', 'sources': sources})}\n\n"
         try:
             for token in llm_client.chat_stream(query, context, history=history,
                                                   context_type=context_type or "readme"):
-                yield f"data: {_json.dumps({'token': token})}\n\n"
+                yield f"data: {_json.dumps({'type': 'token', 'token': token})}\n\n"
             yield "data: [DONE]\n\n"
         except Exception as e:
             logger.error("Stream error: %s", e)
-            yield f"data: {_json.dumps({'token': 'An error occurred while generating the response.'})}\n\n"
+            yield f"data: {_json.dumps({'type': 'token', 'token': 'An error occurred while generating the response.'})}\n\n"
             yield "data: [DONE]\n\n"
 
     return StreamingResponse(generate(), media_type="text/event-stream")

@@ -32,9 +32,16 @@ form.addEventListener("submit", async (e) => {
           const payload = line.slice(6);
           if (payload === "[DONE]") break;
           const parsed = JSON.parse(payload);
-          msgEl.textContent += parsed.token;
-          messages.scrollTop = messages.scrollHeight;
-          fullResponse += parsed.token;
+          if (parsed.type === "sources") {
+            const srcDiv = document.createElement("div");
+            srcDiv.className = "sources";
+            srcDiv.textContent = "Sources: " + parsed.sources.map((s) => s.repo).join(", ");
+            msgEl.appendChild(srcDiv);
+          } else if (parsed.type === "token") {
+            msgEl.insertAdjacentText("beforeend", parsed.token);
+            messages.scrollTop = messages.scrollHeight;
+            fullResponse += parsed.token;
+          }
         }
       }
     }

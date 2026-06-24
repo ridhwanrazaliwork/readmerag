@@ -32,7 +32,7 @@ def get_repos(username: str) -> list[tuple[str, str, str, list[str]]]:
             for r in page_data:
                 repos.append((
                     r["name"],
-                    r.get("updated_at", ""),
+                    r.get("pushed_at", "") or r.get("updated_at", ""),
                     r.get("description") or "",
                     r.get("topics", []),
                 ))

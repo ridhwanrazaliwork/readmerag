@@ -57,14 +57,15 @@ def _make_chunk_id(repo_name: str, text: str, index: int) -> str:
     return f"{repo_name}_{index}_{prefix}"
 
 
+TIME_KEYWORDS = [
+    "latest", "newest", "most recent", "recently",
+    "last updated", "new project", "recent project",
+    "new repo", "newest repo", "latest repo",
+    "last month", "current", "past year",
+]
+
+
 class VectorDB:
-    TIME_KEYWORDS = [
-        "latest", "newest", "most recent", "recently",
-        "last updated", "new project", "recent project",
-        "new repo", "newest repo", "latest repo", 
-        "last month", "current", "past 6 months", "past 3 months",
-        "past year",
-    ]
 
     def __init__(self):
         self.client = chromadb.PersistentClient(path=config.CHROMA_DB_PATH)
@@ -155,7 +156,7 @@ class VectorDB:
 
     def _get_time_filter(self, query: str) -> dict | None:
         query_lower = query.lower()
-        if any(kw in query_lower for kw in self.TIME_KEYWORDS):
+        if any(kw in query_lower for kw in TIME_KEYWORDS):
             from datetime import datetime, timedelta
             cutoff = (datetime.utcnow() - timedelta(days=180)).strftime("%Y%m%d")
             return {"updated_at_ts": {"$gte": int(cutoff)}}
