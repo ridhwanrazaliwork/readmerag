@@ -254,5 +254,6 @@ async def ingest_endpoint():
 
 
 @app.get("/api/health")
+@app.head("/api/health")
 async def health():
     return {"status": "healthy", "chunks": db.count}
