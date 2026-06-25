@@ -1,4 +1,4 @@
-FROM astral-sh/uv:python3.13-bookworm-slim
+FROM ghcr.io/astral-sh/uv:0.11.24-python3.12-trixie-slim AS builder
 
 WORKDIR /app
 ENV UV_COMPILE_BYTECODE=1
